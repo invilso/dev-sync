@@ -1,0 +1,40 @@
+
+{
+  "nodes": [
+    {
+      "id": "Laptop",
+      "ip_vpn": "10.8.0.1",
+      "ip_lan": "192.168.1.10",
+      "sync_root_base_dir": "C:\\DevSync\\Projects"
+    },
+    {
+      "id": "Desktop-PC",
+      "ip_vpn": "10.8.0.2",
+      "ip_lan": "192.168.1.11",
+      "sync_root_base_dir": "D:\\Work\\DevSync"
+    },
+    {
+      "id": "Home-Server",
+      "ip_vpn": "10.8.0.3",
+      "ip_lan": "192.168.1.12",
+      "sync_root_base_dir": "/srv/devsync"
+    }
+  ],
+  "projects": [
+    {
+      "name": "MyAwesomeProject",
+      "port": 8766,
+      "initial_sync_source_node_id": "Laptop",
+      "log_level": "INFO"
+    },
+    {
+      "name": "MyOtherProject",
+      "port": 8767,
+      "initial_sync_source_node_id": "Desktop-PC",
+      "log_level": "DEBUG"
+    }
+  ],
+  "global_config": {
+    "log_level": "INFO"
+  }
+}
