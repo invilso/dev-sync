@@ -367,7 +367,16 @@ class SyncWorker(Process):
                         with open(self.init_marker_path, 'w') as f:
                             pass
                         logging.info(f"Initial sync completed for {self.project_config['name']} from {url}. Marker file created.")
+                        
+                        # После успешной синхронизации, добавляем соединение в пул и запускаем обработчик
+                        self.clients[websocket] = websocket.remote_address
+                        asyncio.create_task(self.handle_outgoing_connection(websocket))
+                        logging.info(f"Connection to initial source {url} is now persistent.")
+
                         sync_successful = True
+                        # Не разрываем соединение, позволяя `async with` завершиться, когда `handle_outgoing_connection` завершится
+                        # Это означает, что мы должны ждать здесь, пока соединение не будет потеряно.
+                        # Вместо этого, мы просто выходим из цикла и позволяем `connect_to_peers` обрабатывать переподключения.
                         break
 
                 except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
