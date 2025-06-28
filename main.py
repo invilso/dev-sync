@@ -122,7 +122,7 @@ class FileMonitor(FileSystemEventHandler):
     def is_ignored(self, path: str) -> bool:
         """Проверяет, должен ли путь быть проигнорирован."""
         # Жестко закодированная проверка для файла-маркера
-        if os.path.basename(path) == ".devsync_init_done":
+        if os.path.basename(path) in FORCE_IGNORED_FILES:
             return True
 
         rel_path = os.path.relpath(path, self.sync_worker.sync_root_dir)
@@ -167,19 +167,31 @@ class SyncWorker(Process):
         self.sync_root_dir = os.path.join(node_config["sync_root_base_dir"], project_config["name"])
         self.node_id = f"{node_config['id']}-{project_config['name']}"
         self.port = project_config["port"]
-        self.target_urls = self._get_target_urls()
+        self.target_nodes = self._get_target_nodes()
         self.clients = {}
         self.init_marker_path = os.path.join(self.sync_root_dir, ".devsync_init_done")
 
-    def _get_target_urls(self):
-        urls = []
+    def _get_target_nodes(self):
+        """Получает список целевых узлов с их IP-адресами в порядке приоритета (LAN, затем VPN)."""
+        nodes = []
         for node in self.all_nodes:
             if node["id"] != self.node_config["id"]:
-                urls.append(f"ws://{node['ip_vpn']}:{self.port}")
-                urls.append(f"ws://{node['ip_lan']}:{self.port}")
+                node_info = {
+                    "id": node["id"],
+                    "ips": [node["ip_lan"], node["ip_vpn"]]  # LAN имеет приоритет
+                }
+                nodes.append(node_info)
+        return nodes
+
+    def _get_all_target_urls(self):
+        """Генерирует все возможные URL для подключения с приоритетом LAN."""
+        urls = []
+        for node in self.target_nodes:
+            for ip in node["ips"]:
+                urls.append(f"ws://{ip}:{self.port}")
         return urls
 
-    async def handle_client(self, websocket, path):
+    async def handle_client(self, websocket, path=None):
         self.clients[websocket] = websocket.remote_address
         try:
             async for message in websocket:
@@ -199,55 +211,103 @@ class SyncWorker(Process):
                          apply_file_event(event_data, self.sync_root_dir, self.node_id)
                          await self.broadcast_to_others(event_data, websocket)
 
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:
+            logging.error(f"Error in handle_client: {e}")
         finally:
-            del self.clients[websocket]
+            if websocket in self.clients:
+                del self.clients[websocket]
 
     async def broadcast_to_others(self, event_data, sender_websocket):
         message = json.dumps(event_data)
+        disconnected_clients = []
         for client in self.clients:
             if client != sender_websocket:
-                await client.send(message)
+                try:
+                    await client.send(message)
+                except websockets.exceptions.ConnectionClosed:
+                    disconnected_clients.append(client)
+        
+        # Удаляем отключенных клиентов
+        for client in disconnected_clients:
+            if client in self.clients:
+                del self.clients[client]
 
     def broadcast(self, event_data):
         asyncio.run(self._async_broadcast(event_data))
 
     async def _async_broadcast(self, event_data):
         message = json.dumps(event_data)
+        disconnected_clients = []
         for client in self.clients:
-            await client.send(message)
+            try:
+                await client.send(message)
+            except websockets.exceptions.ConnectionClosed:
+                disconnected_clients.append(client)
+        
+        # Удаляем отключенных клиентов
+        for client in disconnected_clients:
+            if client in self.clients:
+                del self.clients[client]
 
     async def connect_to_peers(self):
         while True:
-            for url in self.target_urls:
+            # Получаем список всех URL для попытки подключения
+            all_urls = self._get_all_target_urls()
+            
+            for url in all_urls:
                 try:
                     # Проверяем, не подключены ли мы уже к этому URL
-                    # Это простая проверка, чтобы избежать дублирования соединений
                     is_connected = False
-                    for client_ws in self.clients.keys():
-                        # client_ws.remote_address может быть недоступен, если сокет закрыт
+                    for client_ws in list(self.clients.keys()):
                         try:
-                            if f"ws://{client_ws.remote_address[0]}:{client_ws.remote_address[1]}" == url:
-                                is_connected = True
-                                break
+                            if hasattr(client_ws, 'remote_address') and client_ws.remote_address:
+                                remote_url = f"ws://{client_ws.remote_address[0]}:{self.port}"
+                                if remote_url == url:
+                                    is_connected = True
+                                    break
                         except Exception:
-                            # Сокет может быть уже закрыт, игнорируем
                             pass
                     
                     if not is_connected:
-                        # Убрано логгирование попытки подключения для снижения "шума"
-                        # logging.info(f"Attempting to connect to {url}...")
                         websocket = await websockets.connect(url, open_timeout=5)
                         self.clients[websocket] = websocket.remote_address
-                        asyncio.create_task(self.handle_client(websocket, None))
+                        # Запускаем обработчик для исходящего соединения
+                        asyncio.create_task(self.handle_outgoing_connection(websocket))
                         logging.info(f"Successfully connected to {url}.")
                 except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
-                    # Молча игнорируем ошибки, если пир не в сети.
-                    # Это предотвращает флуд в логах.
                     pass
                 except Exception as e:
                     logging.error(f"An unexpected error occurred when connecting to {url}: {e}")
 
             await asyncio.sleep(10)
+
+    async def handle_outgoing_connection(self, websocket):
+        """Обрабатывает исходящие соединения с пирами."""
+        try:
+            async for message in websocket:
+                event_data = json.loads(message)
+                
+                # Обработка ответа на запрос полной синхронизации
+                if isinstance(event_data, list):
+                    # Это полный список состояния
+                    for item in event_data:
+                        if item["source_node_id"] != self.node_id:
+                            apply_file_event(item, self.sync_root_dir, self.node_id)
+                    continue
+
+                if event_data["source_node_id"] != self.node_id:
+                    apply_file_event(event_data, self.sync_root_dir, self.node_id)
+                    await self.broadcast_to_others(event_data, websocket)
+
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:
+            logging.error(f"Error in handle_outgoing_connection: {e}")
+        finally:
+            if websocket in self.clients:
+                del self.clients[websocket]
 
     async def initial_sync(self):
         if os.path.exists(self.init_marker_path):
@@ -267,32 +327,42 @@ class SyncWorker(Process):
             logging.warning(f"Initial sync source node '{source_node_id}' not found in config.")
             return
 
-        url = f"ws://{source_node['ip_vpn']}:{self.port}"
+        # Пытаемся подключиться сначала к LAN, потом к VPN
+        source_urls = [
+            f"ws://{source_node['ip_lan']}:{self.port}",
+            f"ws://{source_node['ip_vpn']}:{self.port}"
+        ]
         
         while not os.path.exists(self.init_marker_path):
-            try:
-                logging.info(f"Attempting initial sync from {url}...")
-                async with websockets.connect(url, open_timeout=10) as websocket:
-                    await websocket.send(json.dumps({"action": "request_full_sync"}))
-                    full_state_json = await asyncio.wait_for(websocket.recv(), timeout=60.0)
-                    full_state = json.loads(full_state_json)
-
-                    for item in full_state:
-                        apply_file_event(item, self.sync_root_dir, self.node_id)
-                    
-                    with open(self.init_marker_path, 'w') as f:
-                        pass
-                    logging.info(f"Initial sync completed for {self.project_config['name']}. Marker file created.")
-                    # Выход из цикла while после успешной синхронизации
-                    break 
-
-            except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
-                logging.info(f"Initial sync source {url} is not available. Retrying in 30 seconds...")
-            except Exception as e:
-                logging.error(f"An unexpected error occurred during initial sync from {url}: {e}. Retrying in 30 seconds...")
+            sync_successful = False
             
-            await asyncio.sleep(30)
+            for url in source_urls:
+                try:
+                    logging.info(f"Attempting initial sync from {url}...")
+                    async with websockets.connect(url, open_timeout=10) as websocket:
+                        await websocket.send(json.dumps({"action": "request_full_sync"}))
+                        full_state_json = await asyncio.wait_for(websocket.recv(), timeout=60.0)
+                        full_state = json.loads(full_state_json)
 
+                        for item in full_state:
+                            apply_file_event(item, self.sync_root_dir, self.node_id)
+                        
+                        with open(self.init_marker_path, 'w') as f:
+                            pass
+                        logging.info(f"Initial sync completed for {self.project_config['name']} from {url}. Marker file created.")
+                        sync_successful = True
+                        break
+
+                except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
+                    logging.info(f"Initial sync source {url} is not available. Trying next address...")
+                except Exception as e:
+                    logging.error(f"An unexpected error occurred during initial sync from {url}: {e}. Trying next address...")
+            
+            if sync_successful:
+                break
+                
+            logging.info("All source addresses failed. Retrying in 30 seconds...")
+            await asyncio.sleep(30)
 
     def run(self):
         os.makedirs(self.sync_root_dir, exist_ok=True)
