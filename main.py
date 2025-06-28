@@ -257,6 +257,11 @@ class SyncWorker(Process):
             all_urls = self._get_all_target_urls()
             
             for url in all_urls:
+                # Пропустить свой же адрес (не соединяемся сами с собой)
+                host = url.split("://")[1].split(":")[0]
+                if host in (self.node_config.get("ip_lan"), self.node_config.get("ip_vpn")):
+                    continue
+
                 try:
                     # Проверяем, не подключены ли мы уже к этому URL
                     is_connected = False
@@ -315,11 +320,15 @@ class SyncWorker(Process):
             return
 
         source_node_id = self.project_config.get("initial_sync_source_node_id")
-        if not source_node_id or source_node_id == self.node_config["id"]:
-            if not os.path.exists(self.init_marker_path):
-                 with open(self.init_marker_path, 'w') as f:
-                    pass
-                 logging.info(f"This node is the initial source. Marker file created for {self.project_config['name']}.")
+        # если не задан источник синхронизации — пропускаем без создания маркера
+        if not source_node_id:
+            logging.warning(f"No initial_sync_source_node_id for {self.project_config['name']}. Skipping initial sync.")
+            return
+        # если я назначен исходным узлом — создаём маркер
+        if source_node_id == self.node_config["id"]:
+            with open(self.init_marker_path, 'w'):
+                pass
+            logging.info(f"This node is the initial source. Marker file created for {self.project_config['name']}.")
             return
 
         source_node = next((n for n in self.all_nodes if n["id"] == source_node_id), None)
