@@ -343,6 +343,9 @@ class SyncWorker(Process):
     async def handle_outgoing_connection(self, websocket):
         """Обрабатывает исходящие соединения с пирами."""
         try:
+            # --- Додаємо запит на повну синхронізацію при кожному новому підключенні ---
+            await websocket.send(json.dumps({"action": "request_full_sync"}))
+            # --- Далі як було ---
             async for message in websocket:
                 event_data = json.loads(message)
                 
