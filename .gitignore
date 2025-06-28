@@ -10,3 +10,4 @@ wheels/
 .venv
 .env
 projects_config.json
+devsync_event_buffer.json

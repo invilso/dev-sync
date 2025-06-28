@@ -19,6 +19,7 @@ import threading
 load_dotenv()
 
 FORCE_IGNORED_FILES = {".devsync_init_done"}
+EVENT_BUFFER_FILE = "devsync_event_buffer.json"
 
 # -----------------------------------------------------------------------------
 #  SyncUtils - Утилиты для синхронизации
@@ -234,6 +235,28 @@ class SyncWorker(Process):
         self.init_marker_path = str(
             Path(self.sync_root_dir) / f".devsync_init_done"
         )
+        self.event_buffer_path = os.path.join(self.sync_root_dir, EVENT_BUFFER_FILE)
+        self.event_buffer = self.load_event_buffer()
+
+    def load_event_buffer(self):
+        if os.path.exists(self.event_buffer_path):
+            try:
+                with open(self.event_buffer_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
+
+    def save_event_buffer(self):
+        try:
+            with open(self.event_buffer_path, "w", encoding="utf-8") as f:
+                json.dump(self.event_buffer, f)
+        except Exception:
+            pass
+
+    def buffer_event(self, event_data):
+        self.event_buffer.append(event_data)
+        self.save_event_buffer()
 
     def _get_target_nodes(self):
         """Получает список целевых узлов с их IP-адресами в порядке приоритета (LAN, затем VPN)."""
@@ -298,21 +321,28 @@ class SyncWorker(Process):
                 del self.clients[client]
 
     def broadcast(self, event_data):
-        asyncio.run(self._async_broadcast(event_data))
+        try:
+            asyncio.run(self._async_broadcast(event_data))
+        except Exception:
+            # Если не удалось отправить — буферизуем
+            self.buffer_event(event_data)
 
     async def _async_broadcast(self, event_data):
         message = json.dumps(event_data)
         disconnected_clients = []
+        sent = False
         for client in self.clients:
             try:
                 await client.send(message)
+                sent = True
             except websockets.exceptions.ConnectionClosed:
                 disconnected_clients.append(client)
-        
-        # Удаляем отключенных клиентов
         for client in disconnected_clients:
             if client in self.clients:
                 del self.clients[client]
+        if not sent:
+            # Если никому не отправили — буферизуем
+            self.buffer_event(event_data)
 
     async def connect_to_peers(self):
         while True:
@@ -354,6 +384,16 @@ class SyncWorker(Process):
     async def handle_outgoing_connection(self, websocket):
         """Обрабатывает исходящие соединения с пирами."""
         try:
+            # --- Сначала відправляємо всі події з буфера ---
+            if self.event_buffer:
+                for event in self.event_buffer:
+                    try:
+                        await websocket.send(json.dumps(event))
+                    except Exception:
+                        break  # Если не удалось — оставляем в буфере
+                self.event_buffer = []
+                self.save_event_buffer()
+            # --- Далі як було ---
             await websocket.send(json.dumps({"action": "request_full_sync"}))
             async for message in websocket:
                 event_data = json.loads(message)
