@@ -15,6 +15,7 @@ from watchdog.events import FileSystemEventHandler
 import websockets
 from dotenv import load_dotenv
 from pathlib import Path
+import threading
 load_dotenv()
 
 FORCE_IGNORED_FILES = {".devsync_init_done"}
@@ -62,10 +63,15 @@ def get_full_directory_state(base_path: str, node_id: str) -> list:
             state.append(generate_file_event("created", dirpath, base_path, node_id))
     return state
 
-def apply_file_event(event_data: dict, base_path: str, local_node_id: str):
-    """Применяет полученное событие к локальной файловой системе."""
+def apply_file_event(event_data: dict, base_path: str, local_node_id: str, file_monitor=None) -> bool:
+    """
+    Применяет полученное событие к локальной файловой системе.
+    Возвращает True, если были внесены изменения, иначе False.
+    """
     full_path = os.path.join(base_path, event_data["path"])
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
+
+    changed = False
 
     if event_data["action"] == "deleted":
         if os.path.exists(full_path):
@@ -73,11 +79,14 @@ def apply_file_event(event_data: dict, base_path: str, local_node_id: str):
                 os.rmdir(full_path)
             else:
                 os.remove(full_path)
-        return
+            changed = True
+        return changed
 
     if event_data["is_directory"]:
-        os.makedirs(full_path, exist_ok=True)
-        return
+        if not os.path.exists(full_path):
+            os.makedirs(full_path, exist_ok=True)
+            changed = True
+        return changed
 
     # Логика разрешения конфликтов
     if os.path.exists(full_path):
@@ -86,24 +95,29 @@ def apply_file_event(event_data: dict, base_path: str, local_node_id: str):
 
         if remote_timestamp < local_timestamp:
             # Локальная версия новее, игнорируем
-            return
+            return False
         elif remote_timestamp == local_timestamp:
             local_hash = get_file_hash(full_path)
             remote_hash = event_data["hash"]
             if local_hash == remote_hash:
                 # Файлы идентичны
-                return
+                return False
             else:
                 # Конфликт!
                 conflict_path = f"{full_path}.conflict-FROM-{event_data['source_node_id']}-{time.strftime('%Y%m%d_%H%M%S')}"
                 with open(conflict_path, "wb") as f:
                     f.write(event_data["content"].encode('utf-8', 'ignore'))
                 logging.warning(f"Conflict detected for {full_path}. Remote version saved to {conflict_path}")
-                return
+                return False # Конфликт не считаем успешным применением для дальнейшей рассылки
 
     with open(full_path, "wb") as f:
         f.write(event_data["content"].encode('utf-8', 'ignore'))
     os.utime(full_path, (event_data["timestamp"], event_data["timestamp"]))
+    changed = True
+
+    if changed and file_monitor is not None:
+        file_monitor.suppress_path(full_path)
+    return changed
 
 
 # -----------------------------------------------------------------------------
@@ -114,7 +128,30 @@ class FileMonitor(FileSystemEventHandler):
     def __init__(self, sync_worker):
         self.sync_worker = sync_worker
         self.ignore_patterns = []
+        self.suppressed_paths = {}  # path -> timestamp
+        self.suppression_time = 2.0  # секунды
         self.update_ignore_patterns()
+
+    def suppress_path(self, path):
+        abs_path = os.path.abspath(path)
+        self.suppressed_paths[abs_path] = time.time()
+        # Запускаем таймер для автоматического удаления suppression
+        threading.Timer(self.suppression_time, self.clear_suppressed, args=(abs_path,)).start()
+
+    def is_suppressed(self, path):
+        abs_path = os.path.abspath(path)
+        ts = self.suppressed_paths.get(abs_path)
+        if ts is None:
+            return False
+        # Если suppression устарел (например, если таймер не сработал), удаляем
+        if time.time() - ts > self.suppression_time:
+            self.clear_suppressed(abs_path)
+            return False
+        return True
+
+    def clear_suppressed(self, path):
+        abs_path = os.path.abspath(path)
+        self.suppressed_paths.pop(abs_path, None)
 
     def update_ignore_patterns(self):
         """Загружает и обновляет паттерны игнорирования из файла .devsyncignore."""
@@ -139,6 +176,11 @@ class FileMonitor(FileSystemEventHandler):
         if self.is_ignored(event.src_path):
             return
 
+        # Подавление эха: если путь подавлен, не отправляем событие и удаляем из suppressed_paths
+        if self.is_suppressed(event.src_path):
+            self.clear_suppressed(event.src_path)
+            return
+
         action = None
         if event.event_type == 'created':
             action = 'created'
@@ -149,6 +191,9 @@ class FileMonitor(FileSystemEventHandler):
         elif event.event_type == 'moved':
             # Обработка как удаление и создание
             if not self.is_ignored(event.dest_path):
+                if self.is_suppressed(event.dest_path):
+                    self.clear_suppressed(event.dest_path)
+                    return
                 delete_event = generate_file_event("deleted", event.src_path, self.sync_worker.sync_root_dir, self.sync_worker.node_id)
                 self.sync_worker.broadcast(delete_event)
             action = 'created'
@@ -214,10 +259,9 @@ class SyncWorker(Process):
                     continue
 
                 if event_data["source_node_id"] != self.node_id:
-                    # Эхо-защита на уровне обработчика
-                    if not self.is_change_local(event_data):
-                         apply_file_event(event_data, self.sync_root_dir, self.node_id)
-                         await self.broadcast_to_others(event_data, websocket)
+                    # Применяем событие и, если оно привело к изменениям, транслируем дальше
+                    if apply_file_event(event_data, self.sync_root_dir, self.node_id, getattr(self, 'file_monitor', None)):
+                        await self.broadcast_to_others(event_data, websocket)
 
         except websockets.exceptions.ConnectionClosed:
             pass
@@ -311,8 +355,8 @@ class SyncWorker(Process):
                     continue
 
                 if event_data["source_node_id"] != self.node_id:
-                    apply_file_event(event_data, self.sync_root_dir, self.node_id)
-                    await self.broadcast_to_others(event_data, websocket)
+                    if apply_file_event(event_data, self.sync_root_dir, self.node_id, getattr(self, 'file_monitor', None)):
+                        await self.broadcast_to_others(event_data, websocket)
 
         except websockets.exceptions.ConnectionClosed:
             pass
@@ -354,35 +398,38 @@ class SyncWorker(Process):
             sync_successful = False
             
             for url in source_urls:
+                websocket = None
                 try:
                     logging.info(f"Attempting initial sync from {url}...")
-                    async with websockets.connect(url, open_timeout=10) as websocket:
-                        await websocket.send(json.dumps({"action": "request_full_sync"}))
-                        full_state_json = await asyncio.wait_for(websocket.recv(), timeout=60.0)
-                        full_state = json.loads(full_state_json)
+                    websocket = await websockets.connect(url, open_timeout=10)
+                    
+                    await websocket.send(json.dumps({"action": "request_full_sync"}))
+                    full_state_json = await asyncio.wait_for(websocket.recv(), timeout=60.0)
+                    full_state = json.loads(full_state_json)
 
-                        for item in full_state:
-                            apply_file_event(item, self.sync_root_dir, self.node_id)
-                        
-                        with open(self.init_marker_path, 'w') as f:
-                            pass
-                        logging.info(f"Initial sync completed for {self.project_config['name']} from {url}. Marker file created.")
-                        
-                        # После успешной синхронизации, добавляем соединение в пул и запускаем обработчик
-                        self.clients[websocket] = websocket.remote_address
-                        asyncio.create_task(self.handle_outgoing_connection(websocket))
-                        logging.info(f"Connection to initial source {url} is now persistent.")
+                    for item in full_state:
+                        apply_file_event(item, self.sync_root_dir, self.node_id)
+                    
+                    with open(self.init_marker_path, 'w') as f:
+                        pass
+                    logging.info(f"Initial sync completed for {self.project_config['name']} from {url}. Marker file created.")
+                    
+                    # После успешной синхронизации, добавляем соединение в пул и запускаем обработчик
+                    self.clients[websocket] = websocket.remote_address
+                    asyncio.create_task(self.handle_outgoing_connection(websocket))
+                    logging.info(f"Connection to initial source {url} is now persistent.")
 
-                        sync_successful = True
-                        # Не разрываем соединение, позволяя `async with` завершиться, когда `handle_outgoing_connection` завершится
-                        # Это означает, что мы должны ждать здесь, пока соединение не будет потеряно.
-                        # Вместо этого, мы просто выходим из цикла и позволяем `connect_to_peers` обрабатывать переподключения.
-                        break
+                    sync_successful = True
+                    break
 
                 except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
                     logging.info(f"Initial sync source {url} is not available. Trying next address...")
+                    if websocket:
+                        await websocket.close()
                 except Exception as e:
                     logging.error(f"An unexpected error occurred during initial sync from {url}: {e}. Trying next address...")
+                    if websocket:
+                        await websocket.close()
             
             if sync_successful:
                 break
@@ -396,6 +443,7 @@ class SyncWorker(Process):
                             format=f'%(asctime)s - {self.node_id} - %(levelname)s - %(message)s')
 
         event_handler = FileMonitor(self)
+        self.file_monitor = event_handler  # Сохраняем ссылку для suppression
         observer = Observer()
         observer.schedule(event_handler, self.sync_root_dir, recursive=True)
         observer.start()
