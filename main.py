@@ -238,26 +238,6 @@ class SyncWorker(Process):
         self.event_buffer_path = os.path.join(self.sync_root_dir, EVENT_BUFFER_FILE)
         self.event_buffer = self.load_event_buffer()
 
-    def load_event_buffer(self):
-        if os.path.exists(self.event_buffer_path):
-            try:
-                with open(self.event_buffer_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                return []
-        return []
-
-    def save_event_buffer(self):
-        try:
-            with open(self.event_buffer_path, "w", encoding="utf-8") as f:
-                json.dump(self.event_buffer, f)
-        except Exception:
-            pass
-
-    def buffer_event(self, event_data):
-        self.event_buffer.append(event_data)
-        self.save_event_buffer()
-
     def _get_target_nodes(self):
         """Получает список целевых узлов с их IP-адресами в порядке приоритета (LAN, затем VPN)."""
         nodes = []
@@ -278,71 +258,112 @@ class SyncWorker(Process):
                 urls.append(f"ws://{ip}:{self.port}")
         return urls
 
-    async def handle_client(self, websocket, path=None):
-        self.clients[websocket] = websocket.remote_address
+    def load_event_buffer(self):
+        if os.path.exists(self.event_buffer_path):
+            try:
+                with open(self.event_buffer_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
+
+    def save_event_buffer(self):
         try:
-            async for message in websocket:
-                event_data = json.loads(message)
-
-                # Обработка запроса на полную синхронизацию
-                if event_data.get("action") == "request_full_sync":
-                    logging.info(f"Received full sync request from {websocket.remote_address}. Preparing state...")
-                    full_state = get_full_directory_state(self.sync_root_dir, self.node_id)
-                    await websocket.send(json.dumps(full_state))
-                    logging.info(f"Full state sent to {websocket.remote_address}.")
-                    continue
-
-                if event_data["source_node_id"] != self.node_id:
-                    # Применяем событие и, если оно привело к изменениям, транслируем дальше
-                    if apply_file_event(event_data, self.sync_root_dir, self.node_id, getattr(self, 'file_monitor', None)):
-                        await self.broadcast_to_others(event_data, websocket)
-
-        except websockets.exceptions.ConnectionClosed:
+            with open(self.event_buffer_path, "w", encoding="utf-8") as f:
+                json.dump(self.event_buffer, f)
+        except Exception:
             pass
-        except Exception as e:
-            logging.error(f"Error in handle_client: {e}")
-        finally:
-            if websocket in self.clients:
-                del self.clients[websocket]
 
-    async def broadcast_to_others(self, event_data, sender_websocket):
-        message = json.dumps(event_data)
-        disconnected_clients = []
-        for client in self.clients:
-            if client != sender_websocket:
+    def buffer_event(self, event_data):
+        # Додаємо подію з переліком node_id, яким ще треба відправити
+        all_node_ids = [n["id"] for n in self.all_nodes if n["id"] != self.node_config["id"]]
+        # Не додаємо дублікатів (по event_data і node_ids)
+        for e in self.event_buffer:
+            if e["event"] == event_data:
+                # Оновлюємо node_ids, якщо треба
+                for node_id in all_node_ids:
+                    if node_id not in e["node_ids"]:
+                        e["node_ids"].append(node_id)
+                self.save_event_buffer()
+                return
+        self.event_buffer.append({"event": event_data, "node_ids": all_node_ids})
+        self.save_event_buffer()
+
+    async def try_flush_event_buffer(self):
+        """Пробует отравить все события из буфера на соответствующие узлы."""
+        if not self.event_buffer or not self.clients:
+            return
+        # Відображення: remote_address -> node_id
+        addr_to_nodeid = {}
+        for node in self.all_nodes:
+            if node["id"] == self.node_config["id"]:
+                continue
+            for client in self.clients:
                 try:
-                    await client.send(message)
-                except websockets.exceptions.ConnectionClosed:
-                    disconnected_clients.append(client)
-        
-        # Удаляем отключенных клиентов
-        for client in disconnected_clients:
-            if client in self.clients:
-                del self.clients[client]
+                    if hasattr(client, "remote_address") and client.remote_address:
+                        ip = client.remote_address[0]
+                        if ip == node["ip_lan"] or ip == node["ip_vpn"]:
+                            addr_to_nodeid[client] = node["id"]
+                except Exception:
+                    continue
+        still_buffered = []
+        for entry in self.event_buffer:
+            event = entry["event"]
+            node_ids = entry["node_ids"]
+            # Для кожного клієнта, якщо його node_id є у node_ids, пробуємо відправити
+            delivered_to = []
+            for client, node_id in addr_to_nodeid.items():
+                if node_id in node_ids:
+                    try:
+                        await client.send(json.dumps(event))
+                        delivered_to.append(node_id)
+                    except Exception:
+                        continue
+            # Видаляємо node_id, яким вдалося відправити
+            entry["node_ids"] = [nid for nid in node_ids if nid not in delivered_to]
+            if entry["node_ids"]:
+                still_buffered.append(entry)
+        self.event_buffer = still_buffered
+        self.save_event_buffer()
 
     def broadcast(self, event_data):
         try:
             asyncio.run(self._async_broadcast(event_data))
         except Exception:
-            # Если не удалось отправить — буферизуем
             self.buffer_event(event_data)
 
     async def _async_broadcast(self, event_data):
         message = json.dumps(event_data)
         disconnected_clients = []
-        sent = False
-        for client in self.clients:
+        sent_to = set()
+        addr_to_nodeid = {}
+        for node in self.all_nodes:
+            if node["id"] == self.node_config["id"]:
+                continue
+            for client in self.clients:
+                try:
+                    if hasattr(client, "remote_address") and client.remote_address:
+                        ip = client.remote_address[0]
+                        if ip == node["ip_lan"] or ip == node["ip_vpn"]:
+                            addr_to_nodeid[client] = node["id"]
+                except Exception:
+                    continue
+        for client, node_id in addr_to_nodeid.items():
             try:
                 await client.send(message)
-                sent = True
+                sent_to.add(node_id)
             except websockets.exceptions.ConnectionClosed:
                 disconnected_clients.append(client)
         for client in disconnected_clients:
             if client in self.clients:
                 del self.clients[client]
-        if not sent:
-            # Если никому не отправили — буферизуем
-            self.buffer_event(event_data)
+        # Якщо не всім вдалося відправити — у буфер
+        all_node_ids = [n["id"] for n in self.all_nodes if n["id"] != self.node_config["id"]]
+        not_sent = [nid for nid in all_node_ids if nid not in sent_to]
+        if not_sent:
+            # Додаємо тільки тим, кому не вдалося
+            self.event_buffer.append({"event": event_data, "node_ids": not_sent})
+            self.save_event_buffer()
 
     async def connect_to_peers(self):
         while True:
@@ -382,18 +403,8 @@ class SyncWorker(Process):
             await asyncio.sleep(10)
 
     async def handle_outgoing_connection(self, websocket):
-        """Обрабатывает исходящие соединения с пирами."""
         try:
-            # --- Сначала відправляємо всі події з буфера ---
-            if self.event_buffer:
-                for event in self.event_buffer:
-                    try:
-                        await websocket.send(json.dumps(event))
-                    except Exception:
-                        break  # Если не удалось — оставляем в буфере
-                self.event_buffer = []
-                self.save_event_buffer()
-            # --- Далі як було ---
+            await self.try_flush_event_buffer()
             await websocket.send(json.dumps({"action": "request_full_sync"}))
             async for message in websocket:
                 event_data = json.loads(message)
@@ -533,6 +544,46 @@ class SyncWorker(Process):
             )
 
         asyncio.run(main())
+
+    async def handle_client(self, websocket, path=None):
+        self.clients[websocket] = websocket.remote_address
+        try:
+            async for message in websocket:
+                event_data = json.loads(message)
+
+                # Обработка запроса на полную синхронизацию
+                if event_data.get("action") == "request_full_sync":
+                    logging.info(f"Received full sync request from {websocket.remote_address}. Preparing state...")
+                    full_state = get_full_directory_state(self.sync_root_dir, self.node_id)
+                    await websocket.send(json.dumps(full_state))
+                    logging.info(f"Full state sent to {websocket.remote_address}.")
+                    continue
+
+                if event_data["source_node_id"] != self.node_id:
+                    # Применяем событие и, если оно привело к изменениям, транслируем дальше
+                    if apply_file_event(event_data, self.sync_root_dir, self.node_id, getattr(self, 'file_monitor', None)):
+                        await self.broadcast_to_others(event_data, websocket)
+
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        except Exception as e:
+            logging.error(f"Error in handle_client: {e}")
+        finally:
+            if websocket in self.clients:
+                del self.clients[websocket]
+
+    async def broadcast_to_others(self, event_data, sender_websocket):
+        message = json.dumps(event_data)
+        disconnected_clients = []
+        for client in self.clients:
+            if client != sender_websocket:
+                try:
+                    await client.send(message)
+                except websockets.exceptions.ConnectionClosed:
+                    disconnected_clients.append(client)
+        for client in disconnected_clients:
+            if client in self.clients:
+                del self.clients[client]
 
 # -----------------------------------------------------------------------------
 #  ProjectManager - Менеджер проектов
