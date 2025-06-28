@@ -63,10 +63,11 @@ def get_full_directory_state(base_path: str, node_id: str) -> list:
             state.append(generate_file_event("created", dirpath, base_path, node_id))
     return state
 
-def apply_file_event(event_data: dict, base_path: str, local_node_id: str, file_monitor=None) -> bool:
+def apply_file_event(event_data: dict, base_path: str, local_node_id: str, file_monitor=None, offline_delete_marker=False) -> bool:
     """
     Применяет полученное событие к локальной файловой системе.
     Возвращает True, если были внесены изменения, иначе False.
+    Если offline_delete_marker=True, то вместо удаления создаёт .to-delete файл.
     """
     full_path = os.path.join(base_path, event_data["path"])
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
@@ -74,13 +75,23 @@ def apply_file_event(event_data: dict, base_path: str, local_node_id: str, file_
     changed = False
 
     if event_data["action"] == "deleted":
-        if os.path.exists(full_path):
-            if event_data["is_directory"]:
-                os.rmdir(full_path)
-            else:
-                os.remove(full_path)
-            changed = True
-        return changed
+        if offline_delete_marker:
+            marker_path = full_path + ".to-delete"
+            if not os.path.exists(marker_path):
+                with open(marker_path, "w", encoding="utf-8") as f:
+                    f.write(f"Marked as deleted by remote sync at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                changed = True
+            if changed and file_monitor is not None:
+                file_monitor.suppress_path(marker_path)
+            return changed
+        else:
+            if os.path.exists(full_path):
+                if event_data["is_directory"]:
+                    os.rmdir(full_path)
+                else:
+                    os.remove(full_path)
+                changed = True
+            return changed
 
     if event_data["is_directory"]:
         if not os.path.exists(full_path):
@@ -343,18 +354,40 @@ class SyncWorker(Process):
     async def handle_outgoing_connection(self, websocket):
         """Обрабатывает исходящие соединения с пирами."""
         try:
-            # --- Додаємо запит на повну синхронізацію при кожному новому підключенні ---
             await websocket.send(json.dumps({"action": "request_full_sync"}))
-            # --- Далі як було ---
             async for message in websocket:
                 event_data = json.loads(message)
                 
                 # Обработка ответа на запрос полной синхронизации
                 if isinstance(event_data, list):
                     # Это полный список состояния
+                    remote_paths = set()
                     for item in event_data:
+                        remote_paths.add(item["path"])
                         if item["source_node_id"] != self.node_id:
                             apply_file_event(item, self.sync_root_dir, self.node_id)
+                    # --- OFFLINE DELETE LOGIC ---
+                    local_paths = set()
+                    for root, dirs, files in os.walk(self.sync_root_dir):
+                        for name in files:
+                            rel_path = os.path.relpath(os.path.join(root, name), self.sync_root_dir)
+                            # Пропускаем служебные и .to-delete файлы
+                            if rel_path.endswith(".to-delete") or os.path.basename(rel_path) in FORCE_IGNORED_FILES:
+                                continue
+                            local_paths.add(rel_path)
+                    # Для каждого локального файла, которого нет у удалённого — создаём .to-delete
+                    for missing_path in local_paths - remote_paths:
+                        # Створюємо подію "deleted" для apply_file_event з offline_delete_marker=True
+                        fake_event = {
+                            "action": "deleted",
+                            "path": missing_path,
+                            "is_directory": False,
+                            "timestamp": time.time(),
+                            "source_node_id": "offline-delete",
+                            "content": None,
+                            "hash": None,
+                        }
+                        apply_file_event(fake_event, self.sync_root_dir, self.node_id, getattr(self, 'file_monitor', None), offline_delete_marker=True)
                     continue
 
                 if event_data["source_node_id"] != self.node_id:
