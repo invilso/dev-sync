@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 import asyncio
 import hashlib
 import json
@@ -11,6 +14,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import websockets
 from dotenv import load_dotenv
+from pathlib import Path
 load_dotenv()
 
 FORCE_IGNORED_FILES = {".devsync_init_done"}
@@ -164,12 +168,16 @@ class SyncWorker(Process):
         self.project_config = project_config
         self.node_config = node_config
         self.all_nodes = all_nodes
-        self.sync_root_dir = os.path.join(node_config["sync_root_base_dir"], project_config["name"])
+        # используем Path для надёжной работы с Unicode-путями
+        self.sync_root_dir = str(Path(node_config["sync_root_base_dir"]) / project_config["name"])
         self.node_id = f"{node_config['id']}-{project_config['name']}"
         self.port = project_config["port"]
         self.target_nodes = self._get_target_nodes()
         self.clients = {}
-        self.init_marker_path = os.path.join(self.sync_root_dir, ".devsync_init_done")
+        # маркер синхронизации на каждую ноду: также через Path
+        self.init_marker_path = str(
+            Path(self.sync_root_dir) / f".devsync_init_done"
+        )
 
     def _get_target_nodes(self):
         """Получает список целевых узлов с их IP-адресами в порядке приоритета (LAN, затем VPN)."""
@@ -399,7 +407,7 @@ class SyncWorker(Process):
 
 class ProjectManager:
     def __init__(self, config_path, current_node_id):
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             self.config = json.load(f)
         self.current_node_id = current_node_id
         self.current_node_config = self._get_current_node_config()
